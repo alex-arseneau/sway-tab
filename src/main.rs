@@ -1,4 +1,5 @@
 mod state;
+mod trace;
 
 // sway-tab — History-aware Alt+Tab for Sway WM
 // Tracks a global window history via focus events and cycles through all
@@ -17,10 +18,10 @@ mod state;
 
 use signal_hook::consts::{SIGINT, SIGTERM, SIGUSR1};
 use signal_hook::iterator::Signals;
-use state::{FocusAction, State};
+use state::State;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use swayipc::{Connection, Event, EventType, Node, NodeType, WindowChange};
 
 const SIGRTMIN: i32 = 34;
@@ -72,128 +73,103 @@ fn parse_args() -> (bool, f64) {
     (trace, timeout)
 }
 
-fn init_trace(trace: bool) {
-    if trace {
-        tracing_subscriber::fmt::Subscriber::builder()
-            .with_max_level(tracing::Level::TRACE)
-            .with_writer(std::io::stderr)
-            .init();
+fn init_trace(enabled: bool) {
+    if enabled {
+        trace::TRACE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-/// Collect all leaf window con_ids from the sway tree.
-/// Walks recursively through nodes and floating_nodes, collecting
-/// Con and FloatingCon nodes that have no child nodes (leaf windows).
-fn collect_window_ids(node: &Node, out: &mut Vec<i64>) {
-    match node.node_type {
-        NodeType::Con | NodeType::FloatingCon => {
-            if node.nodes.is_empty() && node.floating_nodes.is_empty() {
-                // Leaf container — this is a window.
-                out.push(node.id);
-                return;
+/// Query the sway tree and return all window con_ids. The focused window
+/// (if any) is placed last so it ends up at the front of history after
+/// seeding. A single recursive walk gathers both pieces of information.
+fn get_all_windows() -> Result<Vec<i64>, Box<dyn std::error::Error>> {
+    /// Walk the tree once, pushing leaf-window con_ids into `ids` and
+    /// returning the focused leaf's con_id if one is found.
+    fn walk(node: &Node, ids: &mut Vec<i64>) -> Option<i64> {
+        let is_leaf = matches!(node.node_type, NodeType::Con | NodeType::FloatingCon)
+            && node.nodes.is_empty()
+            && node.floating_nodes.is_empty();
+        if is_leaf {
+            ids.push(node.id);
+            return if node.focused { Some(node.id) } else { None };
+        }
+        let mut focused = None;
+        for child in node.nodes.iter().chain(node.floating_nodes.iter()) {
+            if let Some(id) = walk(child, ids) {
+                focused = Some(id);
             }
         }
-        _ => {}
+        focused
     }
-    for child in &node.nodes {
-        collect_window_ids(child, out);
-    }
-    for child in &node.floating_nodes {
-        collect_window_ids(child, out);
-    }
-}
 
-/// Query the sway tree and return all window con_ids.
-/// The focused window (if any) is placed last so it ends up at the
-/// front of history after seeding.
-fn get_all_windows() -> Result<Vec<i64>, Box<dyn std::error::Error>> {
     let mut conn = Connection::new()?;
     let tree = conn.get_tree()?;
     let mut ids = Vec::new();
-    collect_window_ids(&tree, &mut ids);
+    let focused = walk(&tree, &mut ids);
 
-    // Find the currently focused window and move it to the end
-    // so that seed() places it at position 0 (most recent).
-    fn find_focused(node: &Node) -> Option<i64> {
-        if node.focused {
-            return Some(node.id);
-        }
-        for child in &node.nodes {
-            if let Some(id) = find_focused(child) {
-                return Some(id);
-            }
-        }
-        for child in &node.floating_nodes {
-            if let Some(id) = find_focused(child) {
-                return Some(id);
-            }
-        }
-        None
-    }
-
-    if let Some(focused_id) = find_focused(&tree) {
+    if let Some(focused_id) = focused {
         if let Some(pos) = ids.iter().position(|&id| id == focused_id) {
             ids.remove(pos);
             ids.push(focused_id);
         }
     }
 
-    tracing::trace!("get_all_windows: found {} windows", ids.len());
+    trace!("get_all_windows: found {} windows", ids.len());
     Ok(ids)
 }
 
 fn setup_bindings(pid: u32) -> Result<(), Box<dyn std::error::Error>> {
-    tracing::trace!("setup_bindings: pid={pid}");
+    trace!("setup_bindings: pid={pid}");
     let mut conn = Connection::new()?;
 
     // Alt+Tab → SIGUSR1 (advance cycle)
     let cmd = format!("bindsym Alt+Tab exec kill -USR1 {pid}");
-    tracing::trace!("setup_bindings: setting up {cmd}");
+    trace!("setup_bindings: setting up {cmd}");
     let results = conn.run_command(&cmd)?;
     if results.iter().any(|r| r.is_err()) {
-        tracing::trace!("setup_bindings: FAILED to bind Alt+Tab");
+        trace!("setup_bindings: FAILED to bind Alt+Tab");
         return Err("Failed to bind Alt+Tab".into());
     }
 
     // --release Alt+Tab → SIGRTMIN (Tab released while Alt held; resets the commit timer)
     let cmd = format!("bindsym --release Alt+Tab exec kill -RTMIN {pid}");
-    tracing::trace!("setup_bindings: setting up {cmd}");
+    trace!("setup_bindings: setting up {cmd}");
     let results = conn.run_command(&cmd)?;
     if results.iter().any(|r| r.is_err()) {
-        tracing::trace!("setup_bindings: WARNING failed to bind --release Alt+Tab");
+        trace!("setup_bindings: WARNING failed to bind --release Alt+Tab");
         eprintln!("Warning: failed to bind --release Alt+Tab");
     }
 
-    tracing::trace!("setup_bindings: success");
+    trace!("setup_bindings: success");
     Ok(())
 }
 
 fn remove_bindings() {
-    tracing::trace!("remove_bindings: called");
+    trace!("remove_bindings: called");
     let mut conn = match Connection::new() {
         Ok(c) => c,
         Err(e) => {
-            tracing::trace!("remove_bindings: connection FAILED: {e}");
+            trace!("remove_bindings: connection FAILED: {e}");
             eprintln!("Warning: failed to connect for unbinding: {e}");
             return;
         }
     };
     for cmd in ["unbindsym Alt+Tab", "unbindsym --release Alt+Tab"] {
-        tracing::trace!("remove_bindings: {cmd}");
+        trace!("remove_bindings: {cmd}");
         match conn.run_command(cmd) {
             Ok(results) => {
                 if results.iter().any(|r| r.is_err()) {
-                    tracing::trace!("remove_bindings: WARNING failed to unbind {cmd}");
+                    trace!("remove_bindings: WARNING failed to unbind {cmd}");
                     eprintln!("Warning: failed to unbind: {cmd}");
                 }
             }
             Err(e) => {
-                tracing::trace!("remove_bindings: command FAILED: {e}");
+                trace!("remove_bindings: command FAILED: {e}");
                 eprintln!("Warning: unbind command failed: {e}");
             }
         }
     }
-    tracing::trace!("remove_bindings: success");
+    trace!("remove_bindings: success");
 }
 
 fn main() {
@@ -201,7 +177,7 @@ fn main() {
     init_trace(trace);
 
     let commit_timeout = Duration::from_secs_f64(timeout_secs);
-    tracing::trace!(
+    trace!(
         "config: commit_timeout={:.1}s",
         commit_timeout.as_secs_f64()
     );
@@ -211,7 +187,7 @@ fn main() {
         eprintln!("Failed to set up bindings: {e}");
         std::process::exit(1);
     }
-    tracing::trace!("bindings set up");
+    trace!("bindings set up");
 
     let state = Arc::new(Mutex::new(State::default()));
 
@@ -220,7 +196,7 @@ fn main() {
         Ok(ids) => {
             let mut s = state.lock().unwrap();
             s.seed(&ids);
-            tracing::trace!("seeded history with {} windows", ids.len());
+            trace!("seeded history with {} windows", ids.len());
         }
         Err(e) => {
             eprintln!("Warning: failed to seed window history: {e}");
@@ -248,7 +224,7 @@ fn main() {
                 return;
             }
         };
-        tracing::trace!("event loop started");
+        trace!("event loop started");
         for event in events {
             let ev = match event {
                 Ok(ev) => ev,
@@ -262,19 +238,10 @@ fn main() {
                 match window_ev.change {
                     WindowChange::Focus => {
                         let mut s = state_event.lock().unwrap();
-                        let action = s.handle_focus_event(con_id);
-                        match action {
-                            FocusAction::Tracked => {
-                                tracing::trace!("event: con_id={con_id} tracked");
-                            }
-                            FocusAction::Ignored => {}
-                            FocusAction::AutoCommitted => {
-                                tracing::trace!("event: con_id={con_id} auto-committed");
-                            }
-                        }
+                        s.handle_focus_event(con_id);
                     }
                     WindowChange::Close => {
-                        tracing::trace!("event: window closed con_id={con_id}");
+                        trace!("event: window closed con_id={con_id}");
                         let mut s = state_event.lock().unwrap();
                         s.handle_close_event(con_id);
                     }
@@ -284,53 +251,40 @@ fn main() {
         }
     });
 
-    // Timer thread: waits for activation via condvar, then runs commit_timeout.
+    // Timer thread: single loop tracking an Option<Instant> deadline.
+    // None = idle (wait indefinitely); Some = wait until deadline, then commit.
+    // Each reset flag flip from the signal loop pushes the deadline forward.
     let state_timer = state.clone();
     let timer_pair_timer = timer_pair.clone();
     thread::spawn(move || {
+        let (lock, cvar) = &*timer_pair_timer;
+        let mut deadline: Option<Instant> = None;
+        let mut flag = lock.lock().unwrap();
         loop {
-            // Outer loop: wait for activation (first signal sets reset_flag).
-            {
-                let (lock, cvar) = &*timer_pair_timer;
-                let mut flag = lock.lock().unwrap();
-                while !*flag {
-                    flag = cvar.wait(flag).unwrap();
-                }
+            flag = match deadline {
+                None => cvar.wait(flag).unwrap(),
+                Some(d) => match d.checked_duration_since(Instant::now()) {
+                    Some(remaining) => cvar.wait_timeout(flag, remaining).unwrap().0,
+                    None => flag, // already expired — fall through to commit
+                },
+            };
+
+            if *flag {
                 *flag = false;
-            }
-
-            tracing::trace!(
-                "timer_task: activated, waiting {:.1}s",
-                commit_timeout.as_secs_f64()
-            );
-
-            // Inner loop: wait_timeout, restart on reset.
-            loop {
-                let (lock, cvar) = &*timer_pair_timer;
-                let flag = lock.lock().unwrap();
-                let (mut flag, timeout_result) =
-                    cvar.wait_timeout(flag, commit_timeout).unwrap();
-
-                if *flag {
-                    // Reset requested — restart timer.
-                    *flag = false;
-                    tracing::trace!(
-                        "timer_task: reset received, restarting {:.1}s timer",
-                        commit_timeout.as_secs_f64()
-                    );
-                    continue;
+                deadline = Some(Instant::now() + commit_timeout);
+                trace!(
+                    "timer_task: reset, waiting {:.1}s",
+                    commit_timeout.as_secs_f64()
+                );
+            } else if let Some(d) = deadline {
+                if Instant::now() >= d {
+                    trace!("timer_task: timeout expired, committing");
+                    deadline = None;
+                    // Drop the flag lock while we touch state.
+                    drop(flag);
+                    state_timer.lock().unwrap().commit_cycle();
+                    flag = lock.lock().unwrap();
                 }
-
-                if timeout_result.timed_out() {
-                    // Timeout expired — commit.
-                    tracing::trace!("timer_task: timeout expired, committing");
-                    let mut s = state_timer.lock().unwrap();
-                    s.commit_cycle();
-                    break; // back to outer loop
-                }
-
-                // Spurious wakeup — keep waiting (flag was false and no timeout).
-                // This shouldn't normally happen, but handle gracefully.
             }
         }
     });
@@ -342,7 +296,7 @@ fn main() {
     for sig in signals.forever() {
         match sig {
             SIGUSR1 => {
-                tracing::trace!("signal_loop: SIGUSR1 received");
+                trace!("signal_loop: SIGUSR1 received");
                 let mut s = state.lock().unwrap();
                 let target = s.advance_cycle();
                 drop(s);
@@ -352,26 +306,26 @@ fn main() {
                     match Connection::new() {
                         Ok(mut conn) => {
                             let cmd = format!("[con_id={target}] focus");
-                            tracing::trace!("focus: con_id={target} cmd={cmd}");
+                            trace!("focus: con_id={target} cmd={cmd}");
                             match conn.run_command(&cmd) {
                                 Ok(results) => {
                                     if results.iter().any(|r| r.is_err()) {
-                                        tracing::trace!(
+                                        trace!(
                                             "focus: FAILED for con_id={target}"
                                         );
                                         eprintln!("Preview focus error for con_id={target}");
                                     } else {
-                                        tracing::trace!("focus: success con_id={target}");
+                                        trace!("focus: success con_id={target}");
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::trace!("focus: command FAILED: {e}");
+                                    trace!("focus: command FAILED: {e}");
                                     eprintln!("Preview focus error: {e}");
                                 }
                             }
                         }
                         Err(e) => {
-                            tracing::trace!("focus: connection FAILED: {e}");
+                            trace!("focus: connection FAILED: {e}");
                             eprintln!("Connection error: {e}");
                         }
                     }
@@ -381,11 +335,11 @@ fn main() {
                     let mut flag = lock.lock().unwrap();
                     *flag = true;
                     cvar.notify_one();
-                    tracing::trace!("signal_loop: resetting commit timer");
+                    trace!("signal_loop: resetting commit timer");
                 }
             }
             SIGRTMIN => {
-                tracing::trace!(
+                trace!(
                     "signal_loop: SIGRTMIN received (Alt+Tab released), resetting commit timer"
                 );
                 // Just reset the timer.
@@ -395,11 +349,11 @@ fn main() {
                 cvar.notify_one();
             }
             SIGTERM => {
-                tracing::trace!("shutdown signal: SIGTERM");
+                trace!("shutdown signal: SIGTERM");
                 break;
             }
             SIGINT => {
-                tracing::trace!("shutdown signal: SIGINT");
+                trace!("shutdown signal: SIGINT");
                 break;
             }
             _ => {}
@@ -408,5 +362,5 @@ fn main() {
 
     eprintln!("Shutting down...");
     remove_bindings();
-    tracing::trace!("bindings removed");
+    trace!("bindings removed");
 }

@@ -6,7 +6,7 @@ History-aware Alt-Tab daemon for Sway WM.
 
 - Monitors window focus changes through the Sway IPC socket.
 - Automatically registers `Alt+Tab` in Sway on startup.
-- Maintains a history of recently focused windows (up to 15).
+- Maintains a history of recently focused windows.
 - On first `Alt+Tab`, switches to the last active window.
 - While holding Alt and pressing Tab repeatedly, cycles through the full window history.
 - On Alt key release, the currently previewed window is promoted to most-recent.
