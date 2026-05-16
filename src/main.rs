@@ -3,22 +3,27 @@ mod trace;
 // sway-tab — History-aware Alt+Tab for Sway WM
 // Tracks a global window history via focus events and cycles through all
 // recently focused windows when Alt+Tab is pressed, rolling around
-// circularly. Commits the selection lazily: when a focus event arrives
-// that we didn't cause, we auto-commit the last previewed window and
-// record the new focus as the current window.
+// circularly.
+//
+// Commit happens in two ways:
+//   1. Lazy: a focus event arrives that we didn't cause (user clicked,
+//      used a different shortcut, etc.)
+//   2. Timeout: no Alt+Tab press or release arrives within --commit-timeout
+//      seconds, so the selection is committed automatically.
+//
+// Signal assignments:
+//   SIGUSR1  — Alt+Tab pressed (advance cycle, reset timer)
+//   SIGRTMIN — --release Alt+Tab (Tab released while Alt held, reset timer)
 
 use anyhow::Result;
 use clap::Parser;
 use futures_lite::StreamExt;
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::Duration;
 use swayipc_async::{Connection, Event, EventType, WindowChange};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::Mutex;
-use std::sync::Arc;
-
-// Signal assignments:
-//   SIGUSR1 — Alt+Tab pressed (advance cycle)
-//   Commit is lazy: triggered by any focus event we didn't cause.
+use tokio::sync::{watch, Mutex};
 
 /// Persistent history of recently focused windows, populated by focus events.
 /// Deduplicates and maintains recency order so Alt+Tab cycles through
@@ -72,7 +77,7 @@ impl WindowHistory {
     }
 }
 
-/// Shared state between the focus-event loop and the signal handler.
+/// Shared state between the focus-event loop and the signal handlers.
 struct State {
     history: WindowHistory,
     /// Some(_) when the user is actively cycling.
@@ -106,23 +111,22 @@ async fn focus_con_id(conn: &mut Connection, con_id: i64) -> Result<()> {
 }
 
 /// Advance the Alt+Tab cycle by one and preview the target window.
-async fn advance_cycle(state: &Arc<Mutex<State>>) -> Result<()> {
+/// Returns true if the cycle was advanced (so the caller can reset the timer).
+async fn advance_cycle(state: &Arc<Mutex<State>>) -> Result<bool> {
     tracing::trace!("advance_cycle: called");
     let mut s = state.lock().await;
 
     if s.history.len() < 2 {
         tracing::trace!("advance_cycle: history too short, skipping");
-        return Ok(());
+        return Ok(false);
     }
 
     if s.cycle_pos.is_none() {
         // First press: freeze history so preview focuses don't pollute it.
         tracing::trace!("advance_cycle: first press, freezing history, cycle_pos=1");
         s.history.frozen = true;
-        // Position 1 is the previously-focused window (pos 0 is current).
         s.cycle_pos = Some(1);
     } else {
-        // Subsequent press: advance circularly through all history positions.
         let pos = s.cycle_pos.unwrap();
         let next_pos = (pos + 1) % s.history.len();
         tracing::trace!("advance_cycle: advancing cycle_pos {pos} -> {next_pos}");
@@ -134,7 +138,6 @@ async fn advance_cycle(state: &Arc<Mutex<State>>) -> Result<()> {
     s.last_preview = Some(target);
     drop(s);
 
-    // Preview: focus the target window.
     match Connection::new().await {
         Ok(mut conn) => {
             tracing::trace!("advance_cycle: creating new connection for preview");
@@ -151,12 +154,27 @@ async fn advance_cycle(state: &Arc<Mutex<State>>) -> Result<()> {
         }
     }
 
-    Ok(())
+    Ok(true)
+}
+
+/// Commit the currently previewed window and unfreeze history.
+async fn commit_cycle(state: &Arc<Mutex<State>>) {
+    tracing::trace!("commit_cycle: called");
+    let mut s = state.lock().await;
+    if let Some(pos) = s.cycle_pos.take() {
+        tracing::trace!("commit_cycle: committing pos={pos}, unfreezing history");
+        s.history.promote(pos);
+        s.history.frozen = false;
+        s.last_preview = None;
+    } else {
+        tracing::trace!("commit_cycle: no active cycle, nothing to commit");
+    }
 }
 
 async fn setup_bindings(pid: u32) -> Result<()> {
     tracing::trace!("setup_bindings: pid={pid}");
     let mut conn = Connection::new().await?;
+
     // Alt+Tab → SIGUSR1 (advance cycle)
     let cmd = format!("bindsym Alt+Tab exec kill -USR1 {pid}");
     tracing::trace!("setup_bindings: setting up {cmd}");
@@ -166,6 +184,15 @@ async fn setup_bindings(pid: u32) -> Result<()> {
         anyhow::bail!("Failed to bind Alt+Tab");
     }
 
+    // --release Alt+Tab → SIGRTMIN (Tab released while Alt held; resets the commit timer)
+    let cmd = format!("bindsym --release Alt+Tab exec kill -RTMIN {pid}");
+    tracing::trace!("setup_bindings: setting up {cmd}");
+    let results = conn.run_command(&cmd).await?;
+    if results.iter().any(|r| r.is_err()) {
+        tracing::trace!("setup_bindings: WARNING failed to bind --release Alt+Tab");
+        eprintln!("Warning: failed to bind --release Alt+Tab");
+    }
+
     tracing::trace!("setup_bindings: success");
     Ok(())
 }
@@ -173,7 +200,7 @@ async fn setup_bindings(pid: u32) -> Result<()> {
 async fn remove_bindings() -> Result<()> {
     tracing::trace!("remove_bindings: called");
     let mut conn = Connection::new().await?;
-    for cmd in ["unbindsym Alt+Tab"] {
+    for cmd in ["unbindsym Alt+Tab", "unbindsym --release Alt+Tab"] {
         tracing::trace!("remove_bindings: {cmd}");
         let results = conn.run_command(cmd).await?;
         if results.iter().any(|r| r.is_err()) {
@@ -188,14 +215,25 @@ async fn remove_bindings() -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = trace::Cli::parse();
-    tracing::trace!("trace flag: {}", cli.trace);
     trace::init_trace(cli.trace);
+
+    let commit_timeout = Duration::from_secs_f64(cli.commit_timeout);
+    tracing::trace!(
+        "config: commit_timeout={:.1}s",
+        commit_timeout.as_secs_f64()
+    );
 
     let pid = std::process::id();
     setup_bindings(pid).await?;
     tracing::trace!("bindings set up");
 
     let state = Arc::new(Mutex::new(State::default()));
+
+    // watch channel used to reset the commit timer.
+    // Sender sends () each time a tab press or release is received while cycling.
+    // The timer task waits for the timeout after each reset; if none arrives in
+    // time it commits.
+    let (timer_tx, mut timer_rx) = watch::channel(());
 
     // Focus-event loop: populate history from real user focus changes.
     let conn = Connection::new().await?;
@@ -217,14 +255,11 @@ async fn main() -> Result<()> {
                     tracing::trace!("event: focus change on con_id={con_id}");
                     let mut s = state_clone.lock().await;
                     if !s.history.frozen {
-                        // Normal operation: track the focus.
                         s.history.add(con_id);
                     } else if s.last_preview == Some(con_id) {
-                        // This is our own preview focus — ignore it.
                         tracing::trace!("event: focus ignored (our own preview)");
                     } else {
-                        // User moved focus to something we didn't select.
-                        // Auto-commit: promote the last previewed position and unfreeze.
+                        // User moved focus to something we didn't select — lazy commit.
                         tracing::trace!(
                             "event: external focus change to con_id={con_id}, auto-committing"
                         );
@@ -234,7 +269,6 @@ async fn main() -> Result<()> {
                         }
                         s.history.frozen = false;
                         s.last_preview = None;
-                        // Record the new window as the most recent.
                         s.history.add(con_id);
                     }
                 }
@@ -242,14 +276,69 @@ async fn main() -> Result<()> {
         }
     });
 
-    // SIGUSR1: Alt+Tab pressed (advance cycle)
+    // SIGUSR1: Alt+Tab pressed — advance cycle and reset commit timer.
     let mut sigusr1 = signal(SignalKind::user_defined1())?;
     let state_adv = state.clone();
+    let timer_tx_adv = timer_tx.clone();
     let advance_task = tokio::spawn(async move {
         while sigusr1.recv().await.is_some() {
             tracing::trace!("advance_task: SIGUSR1 received");
-            if let Err(e) = advance_cycle(&state_adv).await {
-                eprintln!("Advance error: {e}");
+            match advance_cycle(&state_adv).await {
+                Ok(true) => {
+                    tracing::trace!("advance_task: resetting commit timer");
+                    let _ = timer_tx_adv.send(());
+                }
+                Ok(false) => {}
+                Err(e) => eprintln!("Advance error: {e}"),
+            }
+        }
+    });
+
+    // SIGRTMIN: --release Alt+Tab — Tab released while Alt held; reset commit timer.
+    // SIGRTMIN = signal 34, the lowest realtime signal available for user use.
+    let mut sigrtmin = signal(SignalKind::from_raw(34))?;
+    let timer_tx_rel = timer_tx.clone();
+    let release_task = tokio::spawn(async move {
+        while sigrtmin.recv().await.is_some() {
+            tracing::trace!("release_task: SIGRTMIN received (Alt+Tab released), resetting commit timer");
+            let _ = timer_tx_rel.send(());
+        }
+    });
+
+    // Commit timer: after each reset signal, wait commit_timeout. If no further
+    // reset arrives before the deadline, commit the current selection.
+    let state_timer = state.clone();
+    let timer_task = tokio::spawn(async move {
+        loop {
+            // Outer loop: wait for the first activation (first Alt+Tab press).
+            if timer_rx.changed().await.is_err() {
+                break;
+            }
+            tracing::trace!(
+                "timer_task: activated, waiting {:.1}s",
+                commit_timeout.as_secs_f64()
+            );
+            // Inner loop: keep restarting the sleep on each reset until it
+            // expires. This ensures the last Tab press always starts a fresh
+            // sleep even if no further presses follow.
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(commit_timeout) => {
+                        tracing::trace!("timer_task: timeout expired, committing");
+                        commit_cycle(&state_timer).await;
+                        break; // back to outer loop, await next activation
+                    }
+                    result = timer_rx.changed() => {
+                        if result.is_err() {
+                            return;
+                        }
+                        tracing::trace!(
+                            "timer_task: reset received, restarting {:.1}s timer",
+                            commit_timeout.as_secs_f64()
+                        );
+                        // Sleep will restart on next inner-loop iteration.
+                    }
+                }
             }
         }
     });
@@ -270,6 +359,8 @@ async fn main() -> Result<()> {
     let _ = remove_bindings().await;
     tracing::trace!("bindings removed");
     advance_task.abort();
+    release_task.abort();
+    timer_task.abort();
     event_task.abort();
 
     Ok(())
