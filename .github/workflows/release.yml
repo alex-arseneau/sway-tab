@@ -14,8 +14,11 @@ jobs:
         with:
           ref: ${{ github.event.release.tag_name }}
 
+      - name: Build tests
+        run: cargo build --tests --verbose
+
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test
 
       - name: Set Cargo.toml version from tag
         run: |
