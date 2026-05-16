@@ -1,7 +1,7 @@
 // sway-rust-alttab — History-aware Alt+Tab for Sway WM
 // Tracks a global window history via focus events and cycles through all
 // recently focused windows when Alt+Tab is pressed, rolling around
-// circularly. Uses SIGUSR1 for key presses and a timeout for commitment.
+// circularly. Commits the selection when Alt is released (SIGRTMIN).
 
 use anyhow::Result;
 use futures_lite::StreamExt;
@@ -9,8 +9,11 @@ use std::collections::VecDeque;
 use swayipc_async::{Connection, Event, EventType, WindowChange};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex;
-use tokio::time::{sleep, Duration};
 use std::sync::Arc;
+
+// Signal assignments:
+//   SIGUSR1  — Alt+Tab pressed (advance cycle)
+//   SIGRTMIN — Alt key released (commit selection)
 
 /// Persistent history of recently focused windows, populated by focus events.
 /// Deduplicates and maintains recency order so Alt+Tab cycles through
@@ -18,8 +21,7 @@ use std::sync::Arc;
 #[derive(Default)]
 struct WindowHistory {
     /// Ordered from most-recent (index 0) to least-recent.
-    /// Index 0 = the window you last focused before the current one,
-    /// which is where the first Alt+Tab should go.
+    /// Index 0 = current window, index 1 = previously focused.
     history: VecDeque<i64>,
     max_len: usize,
     /// True while the user is actively cycling — prevents preview
@@ -45,7 +47,6 @@ impl WindowHistory {
         }
     }
 
-
     fn get(&self, pos: usize) -> Option<i64> {
         self.history.get(pos).copied()
     }
@@ -62,14 +63,11 @@ impl WindowHistory {
     }
 }
 
-/// Shared state between the focus-event loop and the SIGUSR1 handler.
+/// Shared state between the focus-event loop and the signal handler.
 struct State {
     history: WindowHistory,
-    /// Some(_) when the user is actively cycling. The usize is the
-    /// index into `history.history`.
+    /// Some(_) when the user is actively cycling.
     cycle_pos: Option<usize>,
-    /// Timeout task handle — cancelled when a new Tab press arrives.
-    pending_commit: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Default for State {
@@ -77,13 +75,9 @@ impl Default for State {
         Self {
             history: WindowHistory::new(15),
             cycle_pos: None,
-            pending_commit: None,
         }
     }
 }
-
-/// How long to wait after the last Alt+Tab press before committing.
-const COMMIT_TIMEOUT_MS: u64 = 300;
 
 /// Focus the given container via sway IPC.
 async fn focus_con_id(conn: &mut Connection, con_id: i64) -> Result<()> {
@@ -95,17 +89,12 @@ async fn focus_con_id(conn: &mut Connection, con_id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Advance the Alt+Tab cycle by one and schedule a commit timeout.
-async fn handle_sigusr1(state: &Arc<Mutex<State>>) -> Result<()> {
+/// Advance the Alt+Tab cycle by one and preview the target window.
+async fn advance_cycle(state: &Arc<Mutex<State>>) -> Result<()> {
     let mut s = state.lock().await;
 
     if s.history.len() < 2 {
         return Ok(());
-    }
-
-    // Cancel any previous pending commit — user pressed again before timeout.
-    if let Some(handle) = s.pending_commit.take() {
-        handle.abort();
     }
 
     if s.cycle_pos.is_none() {
@@ -133,44 +122,55 @@ async fn handle_sigusr1(state: &Arc<Mutex<State>>) -> Result<()> {
         Err(e) => eprintln!("Connection error: {e}"),
     }
 
-    // Schedule commit after COMMIT_TIMEOUT_MS.
-    let state_clone = state.clone();
-    let commit_task = tokio::spawn(async move {
-        sleep(Duration::from_millis(COMMIT_TIMEOUT_MS)).await;
-        // Reacquire and finalize the cycle.
-        let mut s = state_clone.lock().await;
-        if let Some(pos) = s.cycle_pos.take() {
-            s.history.promote(pos);
-            s.history.frozen = false;
-        }
-        s.pending_commit = None;
-    });
-
-    // Store the handle so a subsequent Tab press can cancel it.
-    {
-        let mut s = state.lock().await;
-        s.pending_commit = Some(commit_task);
-    }
-
     Ok(())
 }
 
-async fn setup_binding(pid: u32) -> Result<()> {
+/// Commit the currently previewed window and unfreeze history.
+async fn commit_cycle(state: &Arc<Mutex<State>>) -> Result<()> {
+    let mut s = state.lock().await;
+    if let Some(pos) = s.cycle_pos.take() {
+        s.history.promote(pos);
+        s.history.frozen = false;
+    }
+    Ok(())
+}
+
+async fn setup_bindings(pid: u32) -> Result<()> {
     let mut conn = Connection::new().await?;
+    // Alt+Tab → SIGUSR1 (advance cycle)
     let results = conn
         .run_command(&format!("bindsym Alt+Tab exec kill -USR1 {pid}"))
         .await?;
     if results.iter().any(|r| r.is_err()) {
         anyhow::bail!("Failed to bind Alt+Tab");
     }
+
+    // Alt_L release and Alt_R release → SIGRTMIN (commit cycle)
+    let cmds = [
+        format!("bindsym --release Alt_L exec kill -RTMIN {pid}"),
+        format!("bindsym --release Alt_R exec kill -RTMIN {pid}"),
+    ];
+    for cmd in cmds {
+        let results = conn.run_command(&cmd).await?;
+        if results.iter().any(|r| r.is_err()) {
+            eprintln!("Warning: failed to bind Alt release: {cmd}");
+        }
+    }
+
     Ok(())
 }
 
-async fn remove_binding() -> Result<()> {
+async fn remove_bindings() -> Result<()> {
     let mut conn = Connection::new().await?;
-    let results = conn.run_command("unbindsym Alt+Tab").await?;
-    if results.iter().any(|r| r.is_err()) {
-        eprintln!("Warning: failed to unbind Alt+Tab");
+    for cmd in [
+        "unbindsym Alt+Tab",
+        "unbindsym --release Alt_L",
+        "unbindsym --release Alt_R",
+    ] {
+        let results = conn.run_command(cmd).await?;
+        if results.iter().any(|r| r.is_err()) {
+            eprintln!("Warning: failed to unbind: {cmd}");
+        }
     }
     Ok(())
 }
@@ -178,7 +178,7 @@ async fn remove_binding() -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let pid = std::process::id();
-    setup_binding(pid).await?;
+    setup_bindings(pid).await?;
 
     let state = Arc::new(Mutex::new(State::default()));
 
@@ -201,19 +201,30 @@ async fn main() -> Result<()> {
                     if !s.history.frozen {
                         s.history.add(window_ev.container.id);
                     }
-                    // When frozen, we intentionally ignore focus events
-                    // generated by our own preview focusing.
                 }
             }
         }
     });
 
-    // SIGUSR1 loop: one signal = one Alt+Tab press.
+    // SIGUSR1: Alt+Tab pressed (advance cycle)
     let mut sigusr1 = signal(SignalKind::user_defined1())?;
-    let sigusr1_task = tokio::spawn(async move {
+    let state_adv = state.clone();
+    let advance_task = tokio::spawn(async move {
         while sigusr1.recv().await.is_some() {
-            if let Err(e) = handle_sigusr1(&state).await {
-                eprintln!("Toggle error: {e}");
+            if let Err(e) = advance_cycle(&state_adv).await {
+                eprintln!("Advance error: {e}");
+            }
+        }
+    });
+
+    // SIGRTMIN: Alt released (commit cycle)
+    // SIGRTMIN = signal 34, the lowest realtime signal available for user use.
+    let mut sigrtmin = signal(SignalKind::from_raw(34))?;
+    let state_cmt = state.clone();
+    let commit_task = tokio::spawn(async move {
+        while sigrtmin.recv().await.is_some() {
+            if let Err(e) = commit_cycle(&state_cmt).await {
+                eprintln!("Commit error: {e}");
             }
         }
     });
@@ -227,9 +238,10 @@ async fn main() -> Result<()> {
     }
 
     eprintln!("Shutting down...");
-    let _ = remove_binding().await;
+    let _ = remove_bindings().await;
+    advance_task.abort();
+    commit_task.abort();
     event_task.abort();
-    sigusr1_task.abort();
 
     Ok(())
 }

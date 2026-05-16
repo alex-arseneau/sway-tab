@@ -9,7 +9,7 @@ History-aware Alt-Tab daemon for Sway WM.
 - Maintains a history of recently focused windows (up to 15).
 - On first `Alt+Tab`, switches to the last active window.
 - While holding Alt and pressing Tab repeatedly, cycles through the full window history.
-- On release (after a short timeout), the currently previewed window is promoted to most-recent.
+- On Alt key release, the currently previewed window is promoted to most-recent.
 - History wraps around circularly — keep pressing Tab and you'll eventually return to where you started.
 - On clean shutdown (SIGTERM / SIGINT) it removes the `Alt+Tab` binding.
 
