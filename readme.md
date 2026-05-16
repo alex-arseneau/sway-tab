@@ -1,4 +1,4 @@
-# sway-rust-alttab
+# sway-tab
 
 History-aware Alt-Tab daemon for Sway WM.
 
@@ -21,7 +21,7 @@ History-aware Alt-Tab daemon for Sway WM.
 
 Add this to your Sway config (`~/.config/sway/config`):
 
-    exec sway-rust-alttab
+    exec sway-tab
 
 Then reload Sway or log back in. Press `Alt+Tab` to cycle through recent windows; press Tab repeatedly while holding Alt to go further back in history.
 

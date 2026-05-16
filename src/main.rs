@@ -1,4 +1,4 @@
-// sway-rust-alttab — History-aware Alt+Tab for Sway WM
+// sway-tab — History-aware Alt+Tab for Sway WM
 // Tracks a global window history via focus events and cycles through all
 // recently focused windows when Alt+Tab is pressed, rolling around
 // circularly. Commits the selection when Alt is released (SIGRTMIN).

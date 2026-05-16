@@ -1,5 +1,5 @@
 [package]
-name = "sway-rust-alttab"
+name = "sway-tab"
 version = "1.0.0"
 authors = ["Anonymous"]
 edition = "2021"
