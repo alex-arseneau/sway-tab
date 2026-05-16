@@ -21,7 +21,7 @@ use state::{FocusAction, State};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
-use swayipc::{Connection, Event, EventType, WindowChange};
+use swayipc::{Connection, Event, EventType, Node, NodeType, WindowChange};
 
 const SIGRTMIN: i32 = 34;
 
@@ -79,6 +79,67 @@ fn init_trace(trace: bool) {
             .with_writer(std::io::stderr)
             .init();
     }
+}
+
+/// Collect all leaf window con_ids from the sway tree.
+/// Walks recursively through nodes and floating_nodes, collecting
+/// Con and FloatingCon nodes that have no child nodes (leaf windows).
+fn collect_window_ids(node: &Node, out: &mut Vec<i64>) {
+    match node.node_type {
+        NodeType::Con | NodeType::FloatingCon => {
+            if node.nodes.is_empty() && node.floating_nodes.is_empty() {
+                // Leaf container — this is a window.
+                out.push(node.id);
+                return;
+            }
+        }
+        _ => {}
+    }
+    for child in &node.nodes {
+        collect_window_ids(child, out);
+    }
+    for child in &node.floating_nodes {
+        collect_window_ids(child, out);
+    }
+}
+
+/// Query the sway tree and return all window con_ids.
+/// The focused window (if any) is placed last so it ends up at the
+/// front of history after seeding.
+fn get_all_windows() -> Result<Vec<i64>, Box<dyn std::error::Error>> {
+    let mut conn = Connection::new()?;
+    let tree = conn.get_tree()?;
+    let mut ids = Vec::new();
+    collect_window_ids(&tree, &mut ids);
+
+    // Find the currently focused window and move it to the end
+    // so that seed() places it at position 0 (most recent).
+    fn find_focused(node: &Node) -> Option<i64> {
+        if node.focused {
+            return Some(node.id);
+        }
+        for child in &node.nodes {
+            if let Some(id) = find_focused(child) {
+                return Some(id);
+            }
+        }
+        for child in &node.floating_nodes {
+            if let Some(id) = find_focused(child) {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    if let Some(focused_id) = find_focused(&tree) {
+        if let Some(pos) = ids.iter().position(|&id| id == focused_id) {
+            ids.remove(pos);
+            ids.push(focused_id);
+        }
+    }
+
+    tracing::trace!("get_all_windows: found {} windows", ids.len());
+    Ok(ids)
 }
 
 fn setup_bindings(pid: u32) -> Result<(), Box<dyn std::error::Error>> {
@@ -154,6 +215,19 @@ fn main() {
 
     let state = Arc::new(Mutex::new(State::default()));
 
+    // Seed history with all existing windows so alt-tab works immediately.
+    match get_all_windows() {
+        Ok(ids) => {
+            let mut s = state.lock().unwrap();
+            s.seed(&ids);
+            tracing::trace!("seeded history with {} windows", ids.len());
+        }
+        Err(e) => {
+            eprintln!("Warning: failed to seed window history: {e}");
+            // Not fatal — history will build up from focus events.
+        }
+    }
+
     // Condvar-based timer: (reset_flag, condvar)
     let timer_pair = Arc::new((Mutex::new(false), Condvar::new()));
 
@@ -184,19 +258,27 @@ fn main() {
                 }
             };
             if let Event::Window(window_ev) = ev {
-                if window_ev.change == WindowChange::Focus {
-                    let con_id = window_ev.container.id;
-                    let mut s = state_event.lock().unwrap();
-                    let action = s.handle_focus_event(con_id);
-                    match action {
-                        FocusAction::Tracked => {
-                            tracing::trace!("event: con_id={con_id} tracked");
-                        }
-                        FocusAction::Ignored => {}
-                        FocusAction::AutoCommitted => {
-                            tracing::trace!("event: con_id={con_id} auto-committed");
+                let con_id = window_ev.container.id;
+                match window_ev.change {
+                    WindowChange::Focus => {
+                        let mut s = state_event.lock().unwrap();
+                        let action = s.handle_focus_event(con_id);
+                        match action {
+                            FocusAction::Tracked => {
+                                tracing::trace!("event: con_id={con_id} tracked");
+                            }
+                            FocusAction::Ignored => {}
+                            FocusAction::AutoCommitted => {
+                                tracing::trace!("event: con_id={con_id} auto-committed");
+                            }
                         }
                     }
+                    WindowChange::Close => {
+                        tracing::trace!("event: window closed con_id={con_id}");
+                        let mut s = state_event.lock().unwrap();
+                        s.handle_close_event(con_id);
+                    }
+                    _ => {}
                 }
             }
         }

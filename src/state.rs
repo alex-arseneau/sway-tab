@@ -4,23 +4,23 @@ use std::collections::VecDeque;
 
 /// Persistent history of recently focused windows, populated by focus events.
 /// Deduplicates and maintains recency order so Alt+Tab cycles through
-/// windows in the order the user last visited them.
+/// windows in the order the user last visited them. Size is bounded
+/// naturally by the number of open windows — closed windows are removed
+/// via `remove()`.
 #[derive(Default)]
 pub struct WindowHistory {
     /// Ordered from most-recent (index 0) to least-recent.
     /// Index 0 = current window, index 1 = previously focused.
     history: VecDeque<i64>,
-    max_len: usize,
     /// True while the user is actively cycling — prevents preview
     /// focus events from polluting the history.
     frozen: bool,
 }
 
 impl WindowHistory {
-    pub fn new(max_len: usize) -> Self {
+    pub fn new() -> Self {
         Self {
-            history: VecDeque::with_capacity(max_len),
-            max_len,
+            history: VecDeque::new(),
             frozen: false,
         }
     }
@@ -31,9 +31,13 @@ impl WindowHistory {
         self.history.retain(|&id| id != con_id);
         self.history.push_front(con_id);
         tracing::trace!("history.add: new len={}", self.history.len());
-        while self.history.len() > self.max_len {
-            self.history.pop_back();
-        }
+    }
+
+    /// Remove a window from history (e.g. when it closes).
+    pub fn remove(&mut self, con_id: i64) {
+        tracing::trace!("history.remove: con_id={con_id}");
+        self.history.retain(|&id| id != con_id);
+        tracing::trace!("history.remove: new len={}", self.history.len());
     }
 
     pub fn get(&self, pos: usize) -> Option<i64> {
@@ -78,7 +82,7 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
-            history: WindowHistory::new(15),
+            history: WindowHistory::new(),
             cycle_pos: None,
             last_preview: None,
         }
@@ -86,6 +90,39 @@ impl Default for State {
 }
 
 impl State {
+    /// Seed the history with existing window con_ids (e.g. from sway get_tree).
+    /// Added in order — the first id in the slice will be at the back (oldest),
+    /// the last will be at the front (most recent). Typically called once at
+    /// startup.
+    pub fn seed(&mut self, con_ids: &[i64]) {
+        tracing::trace!("state.seed: {} windows", con_ids.len());
+        for &id in con_ids {
+            self.history.add(id);
+        }
+    }
+
+    /// Handle a window close event. Removes the window from history.
+    /// If the closed window was the current cycle target, cancels the cycle.
+    pub fn handle_close_event(&mut self, con_id: i64) {
+        tracing::trace!("handle_close_event: con_id={con_id}");
+        self.history.remove(con_id);
+
+        // If we were cycling and the closed window was our preview target,
+        // or the history is now too short, cancel the cycle.
+        if self.history.frozen {
+            if self.last_preview == Some(con_id) || self.history.len() < 2 {
+                tracing::trace!("handle_close_event: cancelling active cycle");
+                self.cycle_pos = None;
+                self.last_preview = None;
+                self.history.frozen = false;
+            } else if let Some(pos) = self.cycle_pos {
+                // The cycle_pos may now be out of bounds — clamp it.
+                if pos >= self.history.len() {
+                    self.cycle_pos = Some(self.history.len() - 1);
+                }
+            }
+        }
+    }
     /// Advance cycle by one. Returns Some(target_con_id) to focus, or None if history too short.
     /// On first call: freezes history, sets cycle_pos=1.
     /// On subsequent: advances cycle_pos circularly.
@@ -160,7 +197,7 @@ impl State {
 mod tests {
     use super::*;
 
-    /// Helper: creates a State with max_len=15 and adds the given con_ids in order.
+    /// Helper: creates a State and adds the given con_ids in order.
     /// The *first* element in `ids` ends up at the front (most recent).
     /// e.g. make_state(&[10, 20, 30]) → history = [10, 20, 30]
     fn make_state(ids: &[i64]) -> State {
@@ -176,7 +213,7 @@ mod tests {
 
     #[test]
     fn history_add_front_and_dedup() {
-        let mut h = WindowHistory::new(10);
+        let mut h = WindowHistory::new();
         h.add(1);
         h.add(2);
         h.add(3);
@@ -194,23 +231,32 @@ mod tests {
     }
 
     #[test]
-    fn history_add_respects_max_len() {
-        let mut h = WindowHistory::new(3);
+    fn history_remove_existing() {
+        let mut h = WindowHistory::new();
         h.add(1);
         h.add(2);
         h.add(3);
-        h.add(4); // should evict 1 (oldest)
-        assert_eq!(h.len(), 3);
-        assert_eq!(h.get(0), Some(4));
-        assert_eq!(h.get(1), Some(3));
-        assert_eq!(h.get(2), Some(2));
-        // 1 should be gone
-        assert_eq!(h.get(3), None);
+        // [3, 2, 1]
+        h.remove(2);
+        assert_eq!(h.len(), 2);
+        assert_eq!(h.get(0), Some(3));
+        assert_eq!(h.get(1), Some(1));
+    }
+
+    #[test]
+    fn history_remove_nonexistent_is_noop() {
+        let mut h = WindowHistory::new();
+        h.add(1);
+        h.add(2);
+        h.remove(99);
+        assert_eq!(h.len(), 2);
+        assert_eq!(h.get(0), Some(2));
+        assert_eq!(h.get(1), Some(1));
     }
 
     #[test]
     fn history_get_returns_correct_items() {
-        let mut h = WindowHistory::new(10);
+        let mut h = WindowHistory::new();
         h.add(100);
         h.add(200);
         h.add(300);
@@ -223,7 +269,7 @@ mod tests {
 
     #[test]
     fn history_promote_moves_to_front() {
-        let mut h = WindowHistory::new(10);
+        let mut h = WindowHistory::new();
         h.add(1);
         h.add(2);
         h.add(3);
@@ -238,7 +284,7 @@ mod tests {
 
     #[test]
     fn history_promote_out_of_bounds_is_noop() {
-        let mut h = WindowHistory::new(10);
+        let mut h = WindowHistory::new();
         h.add(1);
         h.add(2);
         // [2, 1]
@@ -469,5 +515,89 @@ mod tests {
         assert_eq!(state.history.get(0), Some(30));
         assert_eq!(state.history.get(1), Some(20));
         assert_eq!(state.history.get(2), Some(10));
+    }
+
+    // ── State::seed tests ─────────────────────────────────────────────
+
+    #[test]
+    fn seed_populates_history() {
+        let mut state = State::default();
+        state.seed(&[1, 2, 3]);
+        // seed adds in order, so 3 is most recent (last added = front)
+        assert_eq!(state.history.len(), 3);
+        assert_eq!(state.history.get(0), Some(3));
+        assert_eq!(state.history.get(1), Some(2));
+        assert_eq!(state.history.get(2), Some(1));
+    }
+
+    #[test]
+    fn seed_deduplicates() {
+        let mut state = State::default();
+        state.seed(&[1, 2, 1, 3]);
+        assert_eq!(state.history.len(), 3);
+        assert_eq!(state.history.get(0), Some(3));
+        assert_eq!(state.history.get(1), Some(1));
+        assert_eq!(state.history.get(2), Some(2));
+    }
+
+    // ── State::handle_close_event tests ───────────────────────────────
+
+    #[test]
+    fn close_removes_from_history() {
+        let mut state = make_state(&[10, 20, 30]);
+        state.handle_close_event(20);
+        assert_eq!(state.history.len(), 2);
+        assert_eq!(state.history.get(0), Some(10));
+        assert_eq!(state.history.get(1), Some(30));
+    }
+
+    #[test]
+    fn close_nonexistent_is_noop() {
+        let mut state = make_state(&[10, 20]);
+        state.handle_close_event(99);
+        assert_eq!(state.history.len(), 2);
+    }
+
+    #[test]
+    fn close_preview_target_cancels_cycle() {
+        let mut state = make_state(&[10, 20, 30]);
+        state.advance_cycle(); // pos 1, target=20, frozen
+        assert!(state.history.frozen);
+        assert_eq!(state.last_preview, Some(20));
+
+        // Close the previewed window
+        state.handle_close_event(20);
+        assert!(!state.history.frozen);
+        assert_eq!(state.cycle_pos, None);
+        assert_eq!(state.last_preview, None);
+        assert_eq!(state.history.len(), 2);
+    }
+
+    #[test]
+    fn close_non_preview_during_cycle_clamps_pos() {
+        let mut state = make_state(&[10, 20, 30]);
+        // Advance twice: pos=2, target=30
+        state.advance_cycle(); // pos 1
+        state.advance_cycle(); // pos 2, target=30
+        assert_eq!(state.cycle_pos, Some(2));
+
+        // Close window 10 (at pos 0 in frozen history [10, 20, 30])
+        // After removal: [20, 30], cycle_pos=2 is out of bounds → clamped to 1
+        state.handle_close_event(10);
+        assert!(state.history.frozen);
+        assert_eq!(state.history.len(), 2);
+        assert_eq!(state.cycle_pos, Some(1));
+    }
+
+    #[test]
+    fn close_during_cycle_too_few_remaining_cancels() {
+        let mut state = make_state(&[10, 20]);
+        state.advance_cycle(); // pos 1, target=20, frozen
+        assert!(state.history.frozen);
+
+        // Close one of the two — only 1 left, can't cycle
+        state.handle_close_event(10);
+        assert!(!state.history.frozen);
+        assert_eq!(state.cycle_pos, None);
     }
 }
