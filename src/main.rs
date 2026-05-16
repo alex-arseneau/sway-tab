@@ -1,3 +1,4 @@
+mod state;
 mod trace;
 
 // sway-tab — History-aware Alt+Tab for Sway WM
@@ -18,84 +19,12 @@ mod trace;
 use anyhow::Result;
 use clap::Parser;
 use futures_lite::StreamExt;
-use std::collections::VecDeque;
+use state::{FocusAction, State};
 use std::sync::Arc;
 use std::time::Duration;
 use swayipc_async::{Connection, Event, EventType, WindowChange};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{watch, Mutex};
-
-/// Persistent history of recently focused windows, populated by focus events.
-/// Deduplicates and maintains recency order so Alt+Tab cycles through
-/// windows in the order the user last visited them.
-#[derive(Default)]
-struct WindowHistory {
-    /// Ordered from most-recent (index 0) to least-recent.
-    /// Index 0 = current window, index 1 = previously focused.
-    history: VecDeque<i64>,
-    max_len: usize,
-    /// True while the user is actively cycling — prevents preview
-    /// focus events from polluting the history.
-    frozen: bool,
-}
-
-impl WindowHistory {
-    fn new(max_len: usize) -> Self {
-        Self {
-            history: VecDeque::with_capacity(max_len),
-            max_len,
-            frozen: false,
-        }
-    }
-
-    /// Add con_id to front of history. If already present, move it.
-    fn add(&mut self, con_id: i64) {
-        tracing::trace!("history.add: con_id={con_id}");
-        self.history.retain(|&id| id != con_id);
-        self.history.push_front(con_id);
-        tracing::trace!("history.add: new len={}", self.history.len());
-        while self.history.len() > self.max_len {
-            self.history.pop_back();
-        }
-    }
-
-    fn get(&self, pos: usize) -> Option<i64> {
-        self.history.get(pos).copied()
-    }
-
-    fn len(&self) -> usize {
-        self.history.len()
-    }
-
-    /// Move the item at `pos` to the front (used on commit).
-    fn promote(&mut self, pos: usize) {
-        tracing::trace!("history.promote: pos={pos}");
-        if let Some(con_id) = self.history.remove(pos) {
-            self.history.push_front(con_id);
-            tracing::trace!("history.promote: con_id={con_id} promoted to front");
-        }
-    }
-}
-
-/// Shared state between the focus-event loop and the signal handlers.
-struct State {
-    history: WindowHistory,
-    /// Some(_) when the user is actively cycling.
-    cycle_pos: Option<usize>,
-    /// The con_id we most recently told sway to focus (our own preview).
-    /// Used to distinguish our preview focus events from real user switches.
-    last_preview: Option<i64>,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            history: WindowHistory::new(15),
-            cycle_pos: None,
-            last_preview: None,
-        }
-    }
-}
 
 /// Focus the given container via sway IPC.
 async fn focus_con_id(conn: &mut Connection, con_id: i64) -> Result<()> {
@@ -113,29 +42,11 @@ async fn focus_con_id(conn: &mut Connection, con_id: i64) -> Result<()> {
 /// Advance the Alt+Tab cycle by one and preview the target window.
 /// Returns true if the cycle was advanced (so the caller can reset the timer).
 async fn advance_cycle(state: &Arc<Mutex<State>>) -> Result<bool> {
-    tracing::trace!("advance_cycle: called");
     let mut s = state.lock().await;
-
-    if s.history.len() < 2 {
-        tracing::trace!("advance_cycle: history too short, skipping");
-        return Ok(false);
-    }
-
-    if s.cycle_pos.is_none() {
-        // First press: freeze history so preview focuses don't pollute it.
-        tracing::trace!("advance_cycle: first press, freezing history, cycle_pos=1");
-        s.history.frozen = true;
-        s.cycle_pos = Some(1);
-    } else {
-        let pos = s.cycle_pos.unwrap();
-        let next_pos = (pos + 1) % s.history.len();
-        tracing::trace!("advance_cycle: advancing cycle_pos {pos} -> {next_pos}");
-        s.cycle_pos = Some(next_pos);
-    }
-
-    let target = s.history.get(s.cycle_pos.unwrap()).unwrap();
-    tracing::trace!("advance_cycle: target con_id={target} for preview");
-    s.last_preview = Some(target);
+    let target = match s.advance_cycle() {
+        Some(t) => t,
+        None => return Ok(false),
+    };
     drop(s);
 
     match Connection::new().await {
@@ -159,16 +70,8 @@ async fn advance_cycle(state: &Arc<Mutex<State>>) -> Result<bool> {
 
 /// Commit the currently previewed window and unfreeze history.
 async fn commit_cycle(state: &Arc<Mutex<State>>) {
-    tracing::trace!("commit_cycle: called");
     let mut s = state.lock().await;
-    if let Some(pos) = s.cycle_pos.take() {
-        tracing::trace!("commit_cycle: committing pos={pos}, unfreezing history");
-        s.history.promote(pos);
-        s.history.frozen = false;
-        s.last_preview = None;
-    } else {
-        tracing::trace!("commit_cycle: no active cycle, nothing to commit");
-    }
+    s.commit_cycle();
 }
 
 async fn setup_bindings(pid: u32) -> Result<()> {
@@ -252,24 +155,16 @@ async fn main() -> Result<()> {
             if let Event::Window(window_ev) = ev {
                 if window_ev.change == WindowChange::Focus {
                     let con_id = window_ev.container.id;
-                    tracing::trace!("event: focus change on con_id={con_id}");
                     let mut s = state_clone.lock().await;
-                    if !s.history.frozen {
-                        s.history.add(con_id);
-                    } else if s.last_preview == Some(con_id) {
-                        tracing::trace!("event: focus ignored (our own preview)");
-                    } else {
-                        // User moved focus to something we didn't select — lazy commit.
-                        tracing::trace!(
-                            "event: external focus change to con_id={con_id}, auto-committing"
-                        );
-                        if let Some(pos) = s.cycle_pos.take() {
-                            s.history.promote(pos);
-                            tracing::trace!("event: auto-commit promoted pos={pos}");
+                    let action = s.handle_focus_event(con_id);
+                    match action {
+                        FocusAction::Tracked => {
+                            tracing::trace!("event: con_id={con_id} tracked");
                         }
-                        s.history.frozen = false;
-                        s.last_preview = None;
-                        s.history.add(con_id);
+                        FocusAction::Ignored => {}
+                        FocusAction::AutoCommitted => {
+                            tracing::trace!("event: con_id={con_id} auto-committed");
+                        }
                     }
                 }
             }
