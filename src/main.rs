@@ -1,9 +1,12 @@
+mod trace;
+
 // sway-tab — History-aware Alt+Tab for Sway WM
 // Tracks a global window history via focus events and cycles through all
 // recently focused windows when Alt+Tab is pressed, rolling around
 // circularly. Commits the selection when Alt is released (SIGRTMIN).
 
 use anyhow::Result;
+use clap::Parser;
 use futures_lite::StreamExt;
 use std::collections::VecDeque;
 use swayipc_async::{Connection, Event, EventType, WindowChange};
@@ -40,8 +43,10 @@ impl WindowHistory {
 
     /// Add con_id to front of history. If already present, move it.
     fn add(&mut self, con_id: i64) {
+        tracing::trace!("history.add: con_id={con_id}");
         self.history.retain(|&id| id != con_id);
         self.history.push_front(con_id);
+        tracing::trace!("history.add: new len={}", self.history.len());
         while self.history.len() > self.max_len {
             self.history.pop_back();
         }
@@ -57,8 +62,10 @@ impl WindowHistory {
 
     /// Move the item at `pos` to the front (used on commit).
     fn promote(&mut self, pos: usize) {
+        tracing::trace!("history.promote: pos={pos}");
         if let Some(con_id) = self.history.remove(pos) {
             self.history.push_front(con_id);
+            tracing::trace!("history.promote: con_id={con_id} promoted to front");
         }
     }
 }
@@ -82,23 +89,29 @@ impl Default for State {
 /// Focus the given container via sway IPC.
 async fn focus_con_id(conn: &mut Connection, con_id: i64) -> Result<()> {
     let cmd = format!("[con_id={con_id}] focus");
+    tracing::trace!("focus: con_id={con_id} cmd={cmd}");
     let results = conn.run_command(&cmd).await?;
     if results.iter().any(|r| r.is_err()) {
+        tracing::trace!("focus: FAILED for con_id={con_id}");
         anyhow::bail!("focus command failed");
     }
+    tracing::trace!("focus: success con_id={con_id}");
     Ok(())
 }
 
 /// Advance the Alt+Tab cycle by one and preview the target window.
 async fn advance_cycle(state: &Arc<Mutex<State>>) -> Result<()> {
+    tracing::trace!("advance_cycle: called");
     let mut s = state.lock().await;
 
     if s.history.len() < 2 {
+        tracing::trace!("advance_cycle: history too short, skipping");
         return Ok(());
     }
 
     if s.cycle_pos.is_none() {
         // First press: freeze history so preview focuses don't pollute it.
+        tracing::trace!("advance_cycle: first press, freezing history, cycle_pos=1");
         s.history.frozen = true;
         // Position 1 is the previously-focused window (pos 0 is current).
         s.cycle_pos = Some(1);
@@ -106,20 +119,29 @@ async fn advance_cycle(state: &Arc<Mutex<State>>) -> Result<()> {
         // Subsequent press: advance circularly through all history positions.
         let pos = s.cycle_pos.unwrap();
         let next_pos = (pos + 1) % s.history.len();
+        tracing::trace!("advance_cycle: advancing cycle_pos {pos} -> {next_pos}");
         s.cycle_pos = Some(next_pos);
     }
 
     let target = s.history.get(s.cycle_pos.unwrap()).unwrap();
+    tracing::trace!("advance_cycle: target con_id={target} for preview");
     drop(s);
 
     // Preview: focus the target window.
     match Connection::new().await {
         Ok(mut conn) => {
+            tracing::trace!("advance_cycle: creating new connection for preview");
             if let Err(e) = focus_con_id(&mut conn, target).await {
+                tracing::trace!("advance_cycle: preview focus FAILED: {e}");
                 eprintln!("Preview focus error: {e}");
+            } else {
+                tracing::trace!("advance_cycle: preview focus success");
             }
         }
-        Err(e) => eprintln!("Connection error: {e}"),
+        Err(e) => {
+            tracing::trace!("advance_cycle: connection FAILED: {e}");
+            eprintln!("Connection error: {e}");
+        }
     }
 
     Ok(())
@@ -127,64 +149,80 @@ async fn advance_cycle(state: &Arc<Mutex<State>>) -> Result<()> {
 
 /// Commit the currently previewed window and unfreeze history.
 async fn commit_cycle(state: &Arc<Mutex<State>>) -> Result<()> {
+    tracing::trace!("commit_cycle: called");
     let mut s = state.lock().await;
     if let Some(pos) = s.cycle_pos.take() {
+        tracing::trace!("commit_cycle: committing pos={pos}, unfreezing history");
         s.history.promote(pos);
         s.history.frozen = false;
+    } else {
+        tracing::trace!("commit_cycle: no active cycle to commit");
     }
     Ok(())
 }
 
 async fn setup_bindings(pid: u32) -> Result<()> {
+    tracing::trace!("setup_bindings: pid={pid}");
     let mut conn = Connection::new().await?;
     // Alt+Tab → SIGUSR1 (advance cycle)
-    let results = conn
-        .run_command(&format!("bindsym Alt+Tab exec kill -USR1 {pid}"))
-        .await?;
+    let cmd = format!("bindsym Alt+Tab exec kill -USR1 {pid}");
+    tracing::trace!("setup_bindings: setting up {cmd}");
+    let results = conn.run_command(&cmd).await?;
     if results.iter().any(|r| r.is_err()) {
+        tracing::trace!("setup_bindings: FAILED to bind Alt+Tab");
         anyhow::bail!("Failed to bind Alt+Tab");
     }
 
     // Alt_L release and Alt_R release → SIGRTMIN (commit cycle)
-    let cmds = [
-        format!("bindsym --release Alt_L exec kill -RTMIN {pid}"),
-        format!("bindsym --release Alt_R exec kill -RTMIN {pid}"),
-    ];
-    for cmd in cmds {
+    for &key in &["Alt_L", "Alt_R"] {
+        let cmd = format!("bindsym --release {key} exec kill -RTMIN {pid}");
+        tracing::trace!("setup_bindings: setting up {cmd}");
         let results = conn.run_command(&cmd).await?;
         if results.iter().any(|r| r.is_err()) {
+            tracing::trace!("setup_bindings: WARNING failed to bind {cmd}");
             eprintln!("Warning: failed to bind Alt release: {cmd}");
         }
     }
 
+    tracing::trace!("setup_bindings: success");
     Ok(())
 }
 
 async fn remove_bindings() -> Result<()> {
+    tracing::trace!("remove_bindings: called");
     let mut conn = Connection::new().await?;
     for cmd in [
         "unbindsym Alt+Tab",
         "unbindsym --release Alt_L",
         "unbindsym --release Alt_R",
     ] {
+        tracing::trace!("remove_bindings: {cmd}");
         let results = conn.run_command(cmd).await?;
         if results.iter().any(|r| r.is_err()) {
+            tracing::trace!("remove_bindings: WARNING failed to unbind {cmd}");
             eprintln!("Warning: failed to unbind: {cmd}");
         }
     }
+    tracing::trace!("remove_bindings: success");
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = trace::Cli::parse();
+    tracing::trace!("trace flag: {}", cli.trace);
+    trace::init_trace(cli.trace);
+
     let pid = std::process::id();
     setup_bindings(pid).await?;
+    tracing::trace!("bindings set up");
 
     let state = Arc::new(Mutex::new(State::default()));
 
     // Focus-event loop: populate history from real user focus changes.
     let conn = Connection::new().await?;
     let mut events = conn.subscribe(&[EventType::Window]).await?;
+    tracing::trace!("event loop started");
     let state_clone = state.clone();
     let event_task = tokio::spawn(async move {
         while let Some(event) = events.next().await {
@@ -197,9 +235,12 @@ async fn main() -> Result<()> {
             };
             if let Event::Window(window_ev) = ev {
                 if window_ev.change == WindowChange::Focus {
+                    tracing::trace!("event: focus change on con_id={}", window_ev.container.id);
                     let mut s = state_clone.lock().await;
                     if !s.history.frozen {
                         s.history.add(window_ev.container.id);
+                    } else {
+                        tracing::trace!("event: focus ignored (history frozen)");
                     }
                 }
             }
@@ -211,6 +252,7 @@ async fn main() -> Result<()> {
     let state_adv = state.clone();
     let advance_task = tokio::spawn(async move {
         while sigusr1.recv().await.is_some() {
+            tracing::trace!("advance_task: SIGUSR1 received");
             if let Err(e) = advance_cycle(&state_adv).await {
                 eprintln!("Advance error: {e}");
             }
@@ -223,6 +265,7 @@ async fn main() -> Result<()> {
     let state_cmt = state.clone();
     let commit_task = tokio::spawn(async move {
         while sigrtmin.recv().await.is_some() {
+            tracing::trace!("commit_task: SIGRTMIN received");
             if let Err(e) = commit_cycle(&state_cmt).await {
                 eprintln!("Commit error: {e}");
             }
@@ -233,12 +276,17 @@ async fn main() -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     tokio::select! {
-        _ = sigterm.recv() => {}
-        _ = sigint.recv() => {}
+        _ = sigterm.recv() => {
+            tracing::trace!("shutdown signal: SIGTERM");
+        }
+        _ = sigint.recv() => {
+            tracing::trace!("shutdown signal: SIGINT");
+        }
     }
 
     eprintln!("Shutting down...");
     let _ = remove_bindings().await;
+    tracing::trace!("bindings removed");
     advance_task.abort();
     commit_task.abort();
     event_task.abort();

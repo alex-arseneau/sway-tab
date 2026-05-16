@@ -8,6 +8,9 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
-swayipc-async = "3"
+clap = { version = "4", features = ["derive"] }
 futures-lite = "2"
+swayipc-async = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
