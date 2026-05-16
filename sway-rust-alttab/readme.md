@@ -1,13 +1,16 @@
 # sway-rust-alttab
 
-Minimal Alt-Tab daemon for Sway WM.
+History-aware Alt-Tab daemon for Sway WM.
 
 ## What it does
 
 - Monitors window focus changes through the Sway IPC socket.
 - Automatically registers `Alt+Tab` in Sway on startup.
-- When you press `Alt+Tab`, Sway sends `SIGUSR1` to the daemon.
-- The daemon switches focus back to the previously focused window.
+- Maintains a history of recently focused windows (up to 15).
+- On first `Alt+Tab`, switches to the last active window.
+- While holding Alt and pressing Tab repeatedly, cycles through the full window history.
+- On release (after a short timeout), the currently previewed window is promoted to most-recent.
+- History wraps around circularly — keep pressing Tab and you'll eventually return to where you started.
 - On clean shutdown (SIGTERM / SIGINT) it removes the `Alt+Tab` binding.
 
 ## Build
@@ -20,7 +23,7 @@ Add this to your Sway config (`~/.config/sway/config`):
 
     exec sway-rust-alttab
 
-Then reload Sway or log back in. Press `Alt+Tab` to switch between the current and previous window.
+Then reload Sway or log back in. Press `Alt+Tab` to cycle through recent windows; press Tab repeatedly while holding Alt to go further back in history.
 
 ## Requirements
 
