@@ -34,3 +34,7 @@ Then reload Sway or log back in. Press `Alt+Tab` to cycle through recent windows
 
 - If you already have `bindsym Alt+Tab` in your Sway config, that binding takes precedence and the daemon's binding will not execute.
 - The daemon must be running for `Alt+Tab` to work. If it crashes or is killed with `SIGKILL`, the binding may remain in Sway as a no-op until you restart the daemon or manually run `unbindsym Alt+Tab`.
+
+## Inspired By
+
+- [sway-alttab](https://github.com/autolyticus/sway-alttab)
