@@ -1,5 +1,4 @@
 mod state;
-mod trace;
 
 // sway-tab — History-aware Alt+Tab for Sway WM
 // Tracks a global window history via focus events and cycles through all
@@ -19,26 +18,41 @@ mod trace;
 use signal_hook::consts::{SIGINT, SIGTERM, SIGUSR1};
 use signal_hook::iterator::Signals;
 use state::State;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use swayipc::{Connection, Event, EventType, Node, NodeType, WindowChange};
 
 const SIGRTMIN: i32 = 34;
+const DEFAULT_TIMEOUT: f64 = 4.0;
+
+// Tiny replacement for tracing::trace! — a single global flag toggling
+// stderr prints when `--trace` is passed on the command line.
+pub static TRACE: AtomicBool = AtomicBool::new(false);
+
+#[macro_export]
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        if $crate::TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!($($arg)*);
+        }
+    };
+}
 
 fn print_usage() {
     eprintln!("Usage: sway-tab [OPTIONS]");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --trace          Enable verbose trace logging to stderr");
-    eprintln!("  --timeout N, -t N  Commit timeout in seconds (default: 10.0)");
+    eprintln!("  --timeout N, -t N  Commit timeout in seconds (default: {DEFAULT_TIMEOUT:.1})");
     eprintln!("  --help, -h       Print this help and exit");
 }
 
 fn parse_args() -> (bool, f64) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut trace = false;
-    let mut timeout = 4.0_f64;
+    let mut timeout = DEFAULT_TIMEOUT;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -73,9 +87,40 @@ fn parse_args() -> (bool, f64) {
     (trace, timeout)
 }
 
-fn init_trace(enabled: bool) {
-    if enabled {
-        trace::TRACE.store(true, std::sync::atomic::Ordering::Relaxed);
+/// Set the timer's reset flag and wake the timer thread so it pushes its
+/// deadline forward.
+fn reset_timer(timer_pair: &(Mutex<bool>, Condvar)) {
+    let (lock, cvar) = timer_pair;
+    let mut flag = lock.lock().unwrap();
+    *flag = true;
+    cvar.notify_one();
+}
+
+/// Connect to sway and focus the given window, reporting any error.
+fn focus_window(con_id: i64) {
+    let mut conn = match Connection::new() {
+        Ok(conn) => conn,
+        Err(e) => {
+            trace!("focus: connection FAILED: {e}");
+            eprintln!("Connection error: {e}");
+            return;
+        }
+    };
+    let cmd = format!("[con_id={con_id}] focus");
+    trace!("focus: con_id={con_id} cmd={cmd}");
+    match conn.run_command(&cmd) {
+        Ok(results) => {
+            if results.iter().any(|r| r.is_err()) {
+                trace!("focus: FAILED for con_id={con_id}");
+                eprintln!("Preview focus error for con_id={con_id}");
+            } else {
+                trace!("focus: success con_id={con_id}");
+            }
+        }
+        Err(e) => {
+            trace!("focus: command FAILED: {e}");
+            eprintln!("Preview focus error: {e}");
+        }
     }
 }
 
@@ -174,7 +219,9 @@ fn remove_bindings() {
 
 fn main() {
     let (trace, timeout_secs) = parse_args();
-    init_trace(trace);
+    if trace {
+        TRACE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 
     let commit_timeout = Duration::from_secs_f64(timeout_secs);
     trace!(
@@ -297,44 +344,10 @@ fn main() {
         match sig {
             SIGUSR1 => {
                 trace!("signal_loop: SIGUSR1 received");
-                let mut s = state.lock().unwrap();
-                let target = s.advance_cycle();
-                drop(s);
-
+                let target = state.lock().unwrap().advance_cycle();
                 if let Some(target) = target {
-                    // Focus the target window.
-                    match Connection::new() {
-                        Ok(mut conn) => {
-                            let cmd = format!("[con_id={target}] focus");
-                            trace!("focus: con_id={target} cmd={cmd}");
-                            match conn.run_command(&cmd) {
-                                Ok(results) => {
-                                    if results.iter().any(|r| r.is_err()) {
-                                        trace!(
-                                            "focus: FAILED for con_id={target}"
-                                        );
-                                        eprintln!("Preview focus error for con_id={target}");
-                                    } else {
-                                        trace!("focus: success con_id={target}");
-                                    }
-                                }
-                                Err(e) => {
-                                    trace!("focus: command FAILED: {e}");
-                                    eprintln!("Preview focus error: {e}");
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            trace!("focus: connection FAILED: {e}");
-                            eprintln!("Connection error: {e}");
-                        }
-                    }
-
-                    // Notify timer (set flag + notify).
-                    let (lock, cvar) = &*timer_pair;
-                    let mut flag = lock.lock().unwrap();
-                    *flag = true;
-                    cvar.notify_one();
+                    focus_window(target);
+                    reset_timer(&timer_pair);
                     trace!("signal_loop: resetting commit timer");
                 }
             }
@@ -342,18 +355,10 @@ fn main() {
                 trace!(
                     "signal_loop: SIGRTMIN received (Alt+Tab released), resetting commit timer"
                 );
-                // Just reset the timer.
-                let (lock, cvar) = &*timer_pair;
-                let mut flag = lock.lock().unwrap();
-                *flag = true;
-                cvar.notify_one();
+                reset_timer(&timer_pair);
             }
-            SIGTERM => {
-                trace!("shutdown signal: SIGTERM");
-                break;
-            }
-            SIGINT => {
-                trace!("shutdown signal: SIGINT");
+            SIGTERM | SIGINT => {
+                trace!("shutdown signal: {sig}");
                 break;
             }
             _ => {}
