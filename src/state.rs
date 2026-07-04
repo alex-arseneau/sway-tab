@@ -6,11 +6,12 @@ use crate::trace;
 ///
 /// `history` is ordered from most-recent (index 0) to least-recent. Index
 /// 0 is the current window, index 1 is the previously focused window,
-/// etc. `frozen` is set while the user is actively cycling — it prevents
-/// our own preview focus events from polluting the history.
+/// etc. The state is "cycling" (see [`State::cycling`]) while the user is
+/// actively cycling — `cycle_pos` is `Some(_)`. While cycling we ignore our
+/// own preview focus events so they don't pollute the history.
+#[derive(Default)]
 pub struct State {
     pub history: Vec<i64>,
-    pub frozen: bool,
     /// Some(_) when the user is actively cycling.
     pub cycle_pos: Option<usize>,
     /// The con_id we most recently told sway to focus (our own preview).
@@ -18,18 +19,12 @@ pub struct State {
     pub last_preview: Option<i64>,
 }
 
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            history: Vec::new(),
-            frozen: false,
-            cycle_pos: None,
-            last_preview: None,
-        }
-    }
-}
-
 impl State {
+    /// True while the user is actively cycling.
+    fn cycling(&self) -> bool {
+        self.cycle_pos.is_some()
+    }
+
     /// Add con_id to front of history. If already present, move it.
     fn add(&mut self, con_id: i64) {
         trace!("history.add: con_id={con_id}");
@@ -74,12 +69,11 @@ impl State {
 
         // If we were cycling and the closed window was our preview target,
         // or the history is now too short, cancel the cycle.
-        if self.frozen {
+        if self.cycling() {
             if self.last_preview == Some(con_id) || self.history.len() < 2 {
                 trace!("handle_close_event: cancelling active cycle");
                 self.cycle_pos = None;
                 self.last_preview = None;
-                self.frozen = false;
             } else if let Some(pos) = self.cycle_pos {
                 // The cycle_pos may now be out of bounds — clamp it.
                 if pos >= self.history.len() {
@@ -100,19 +94,21 @@ impl State {
             return None;
         }
 
-        if self.cycle_pos.is_none() {
-            // First press: freeze history so preview focuses don't pollute it.
-            trace!("advance_cycle: first press, freezing history, cycle_pos=1");
-            self.frozen = true;
-            self.cycle_pos = Some(1);
-        } else {
-            let pos = self.cycle_pos.unwrap();
-            let next_pos = (pos + 1) % self.history.len();
-            trace!("advance_cycle: advancing cycle_pos {pos} -> {next_pos}");
-            self.cycle_pos = Some(next_pos);
-        }
+        let pos = match self.cycle_pos {
+            None => {
+                // First press: freeze history so preview focuses don't pollute it.
+                trace!("advance_cycle: first press, freezing history, cycle_pos=1");
+                1
+            }
+            Some(pos) => {
+                let next_pos = (pos + 1) % self.history.len();
+                trace!("advance_cycle: advancing cycle_pos {pos} -> {next_pos}");
+                next_pos
+            }
+        };
+        self.cycle_pos = Some(pos);
 
-        let target = self.history[self.cycle_pos.unwrap()];
+        let target = self.history[pos];
         trace!("advance_cycle: target con_id={target} for preview");
         self.last_preview = Some(target);
 
@@ -126,7 +122,6 @@ impl State {
         if let Some(pos) = self.cycle_pos.take() {
             trace!("commit_cycle: committing pos={pos}, unfreezing history");
             self.promote(pos);
-            self.frozen = false;
             self.last_preview = None;
         } else {
             trace!("commit_cycle: no active cycle, nothing to commit");
@@ -136,20 +131,16 @@ impl State {
     /// Handle an incoming focus event.
     pub fn handle_focus_event(&mut self, con_id: i64) {
         trace!("event: focus change on con_id={con_id}");
-        if !self.frozen {
+        if !self.cycling() {
             self.add(con_id);
             trace!("event: con_id={con_id} tracked");
         } else if self.last_preview == Some(con_id) {
             trace!("event: focus ignored (our own preview)");
         } else {
-            // User moved focus to something we didn't select — lazy commit.
+            // User moved focus to something we didn't select — lazy commit
+            // the in-progress cycle, then track the new focus.
             trace!("event: external focus change to con_id={con_id}, auto-committing");
-            if let Some(pos) = self.cycle_pos.take() {
-                self.promote(pos);
-                trace!("event: auto-commit promoted pos={pos}");
-            }
-            self.frozen = false;
-            self.last_preview = None;
+            self.commit_cycle();
             self.add(con_id);
             trace!("event: con_id={con_id} auto-committed");
         }
@@ -264,7 +255,6 @@ mod tests {
         let result = state.advance_cycle();
         assert_eq!(result, Some(20)); // pos 1 = second item
         assert_eq!(state.cycle_pos, Some(1));
-        assert!(state.frozen);
         assert_eq!(state.last_preview, Some(20));
     }
 
@@ -293,13 +283,13 @@ mod tests {
     #[test]
     fn advance_cycle_frozen_during_cycling() {
         let mut state = make_state(&[10, 20, 30]);
-        assert!(!state.frozen);
+        assert_eq!(state.cycle_pos, None);
 
         state.advance_cycle();
-        assert!(state.frozen);
+        assert!(state.cycle_pos.is_some());
 
         state.advance_cycle();
-        assert!(state.frozen);
+        assert!(state.cycle_pos.is_some());
     }
 
     // ── State::commit_cycle tests ────────────────────────────────────
@@ -317,7 +307,6 @@ mod tests {
 
         // 30 should be promoted to front: [30, 10, 20]
         assert_eq!(state.history, vec![30, 10, 20]);
-        assert!(!state.frozen);
         assert_eq!(state.last_preview, None);
         assert_eq!(state.cycle_pos, None);
     }
@@ -329,7 +318,6 @@ mod tests {
         state.commit_cycle(); // should not panic
         assert_eq!(state.history, vec![10, 20]);
         assert_eq!(state.cycle_pos, None);
-        assert!(!state.frozen);
     }
 
     // ── State::handle_focus_event tests ──────────────────────────────
@@ -346,15 +334,15 @@ mod tests {
     fn handle_focus_frozen_matching_preview_ignored() {
         let mut state = make_state(&[10, 20, 30]);
         // Start cycling
-        state.advance_cycle(); // pos 1, target=20, frozen=true
-        assert!(state.frozen);
+        state.advance_cycle(); // pos 1, target=20, cycling
+        assert!(state.cycle_pos.is_some());
 
         // Sway sends focus event for our own preview (20)
         state.handle_focus_event(20);
 
         // History should be unchanged: [10, 20, 30]
         assert_eq!(state.history, vec![10, 20, 30]);
-        assert!(state.frozen); // still frozen
+        assert!(state.cycle_pos.is_some()); // still cycling
     }
 
     #[test]
@@ -371,7 +359,6 @@ mod tests {
         // Then add 99: [99, 20, 10, 30]
         assert_eq!(state.history, vec![99, 20, 10, 30]);
 
-        assert!(!state.frozen);
         assert_eq!(state.last_preview, None);
         assert_eq!(state.cycle_pos, None);
     }
@@ -392,7 +379,6 @@ mod tests {
 
         // History should be [1, 3, 2]
         assert_eq!(state.history, vec![1, 3, 2]);
-        assert!(!state.frozen);
         assert_eq!(state.cycle_pos, None);
     }
 
@@ -403,7 +389,7 @@ mod tests {
 
         // Advance once → previews B=20 at pos 1
         assert_eq!(state.advance_cycle(), Some(20));
-        assert!(state.frozen);
+        assert!(state.cycle_pos.is_some());
 
         // External focus event to D=40 (user clicked a different window)
         state.handle_focus_event(40);
@@ -412,7 +398,7 @@ mod tests {
         // Promote pos 1: [10, 20, 30] → [20, 10, 30]
         // Add 40: [40, 20, 10, 30]
         assert_eq!(state.history, vec![40, 20, 10, 30]);
-        assert!(!state.frozen);
+        assert_eq!(state.cycle_pos, None);
     }
 
     #[test]
@@ -430,7 +416,6 @@ mod tests {
         // Second cycle: should start from updated history
         assert_eq!(state.advance_cycle(), Some(10)); // pos 1 = A=10
         assert_eq!(state.cycle_pos, Some(1));
-        assert!(state.frozen);
 
         // Advance again
         assert_eq!(state.advance_cycle(), Some(30)); // pos 2 = C=30
@@ -476,13 +461,12 @@ mod tests {
     #[test]
     fn close_preview_target_cancels_cycle() {
         let mut state = make_state(&[10, 20, 30]);
-        state.advance_cycle(); // pos 1, target=20, frozen
-        assert!(state.frozen);
+        state.advance_cycle(); // pos 1, target=20, cycling
+        assert!(state.cycle_pos.is_some());
         assert_eq!(state.last_preview, Some(20));
 
         // Close the previewed window
         state.handle_close_event(20);
-        assert!(!state.frozen);
         assert_eq!(state.cycle_pos, None);
         assert_eq!(state.last_preview, None);
         assert_eq!(state.history.len(), 2);
@@ -499,7 +483,7 @@ mod tests {
         // Close window 10 (at pos 0 in frozen history [10, 20, 30])
         // After removal: [20, 30], cycle_pos=2 is out of bounds → clamped to 1
         state.handle_close_event(10);
-        assert!(state.frozen);
+        assert!(state.cycle_pos.is_some());
         assert_eq!(state.history.len(), 2);
         assert_eq!(state.cycle_pos, Some(1));
     }
@@ -507,12 +491,11 @@ mod tests {
     #[test]
     fn close_during_cycle_too_few_remaining_cancels() {
         let mut state = make_state(&[10, 20]);
-        state.advance_cycle(); // pos 1, target=20, frozen
-        assert!(state.frozen);
+        state.advance_cycle(); // pos 1, target=20, cycling
+        assert!(state.cycle_pos.is_some());
 
         // Close one of the two — only 1 left, can't cycle
         state.handle_close_event(10);
-        assert!(!state.frozen);
         assert_eq!(state.cycle_pos, None);
     }
 }
